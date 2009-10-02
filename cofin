@@ -1,0 +1,488 @@
+#!/usr/bin/perl 
+
+use strict;
+use warnings;
+
+use Archive::Tar qw//;
+use File::Find qw/find/;
+use Digest::MD5 qw/md5_hex/;
+use Getopt::Long qw/GetOptions/;
+use File::Temp qw//;
+
+use constant SPECFILE => 'nail.spec';
+use constant SUMSFILE => '.nailsums';
+use constant VERSIONFILE => '.nailversion';
+
+my $FORCE = 0;
+my $REVERSE = 0;
+GetOptions(
+    force => \$FORCE,
+    'reverse' => \$REVERSE,
+);
+main(@ARGV);
+
+sub main {
+    my ($operation, @args) = @_;
+
+    $operation ||= '';
+
+    if ($operation eq 'package') {
+	make_package(@args);
+    } elsif ($operation eq 'install') {
+	install_package(@args);
+    } elsif ($operation eq 'remove') {
+	remove_package(@args);
+    } elsif ($operation eq 'list') {
+	list_package(@args);
+    } elsif ($operation eq 'diff') {
+	diff_package(@args);
+    } elsif ($operation eq 'status') {
+	status_package(@args);
+    } else {
+	usage();
+	exit -1;
+    }
+}
+
+sub usage {
+    print STDERR <<EOF;
+Usage: $0 <command> [args]
+    package <CVS module> <CVS tag>
+    list <package file>
+    status
+    diff <package file>
+    install <package file>
+    remove
+EOF
+}
+
+sub make_package {
+    my ($name, $tag) = @_;
+
+    die "Name not set\n" unless $name;
+    die "Tag not set\n" unless $tag;
+
+    chdir '/tmp';
+
+    eval {
+	require Cvs;
+    };
+
+    if ($@) {
+	if ($FORCE) {
+	    print STDERR "Using shell cvs\n";
+	    system(qw/cvs co -r/, $tag, $name);
+	    chdir $name;
+	} else {
+	    die "Cvs perl module not installed, use --force to fallback to shell CVS\n";
+	}
+    } else {
+	no warnings 'once';
+	my $cvs = Cvs->new($name, cvsroot => $ENV{CVSROOT}) or die "$Cvs::ERROR\n";
+	use warnings 'all';
+	$cvs->checkout($name, {revision => $tag, reset => 0}) or die "Could not check out revision $tag\n";
+	chdir $name;
+    }
+
+
+    my $outfilename = "$name-$tag.nail";
+
+    my $spec = {};
+    open my $fh, '<', SPECFILE or die "Could not load spec file: `$!'";
+
+    my $ops = {
+        '+' => 'add',
+        '-' => 'exclude',
+        '~' => 'match_exclude',
+    };
+
+    while (my $line = <$fh>) {
+        chomp $line;
+
+        if ($line =~ /^#/) {
+        } elsif ($line =~ /^(nameformat|destination|prune)\:\s*(.+?)$/) {
+            $spec->{cfg}->{$1} = $2;
+        } elsif ($line =~ /^\s*([\-\+\~])\s*(.+?)\/*$/) {
+            my $op = $ops->{$1};
+
+            die "Unknown operation `$1'\n" unless $op;
+
+            $spec->{$op}->{$2} = 1;
+        }
+    }
+
+    close $fh;
+
+    my $nail = Archive::Tar->new();
+    my %files = ();
+
+    foreach my $file (keys %{$spec->{add}}) {
+        find(
+	    sub {
+		my $curfile = $File::Find::name;
+		my $curdir = $File::Find::dir;
+
+		return if $_ eq SPECFILE;
+		return if $_ =~ /\.nail$/;
+
+		if ($spec->{exclude}->{$curfile}) {
+		    $File::Find::prune = 1;
+		    return;
+		}
+
+		foreach my $test (keys %{$spec->{match_exclude}}) {
+		    return if $curfile =~ /$test/;
+		}
+
+		return if $curfile eq '.' or $curfile eq './';
+
+		$files{$curfile} = 1;
+
+		$curdir =~ s/\/+$//g;
+		if ($curdir ne '.') {
+		    $files{$curdir} = 1;
+		}
+            },
+            $file
+        );
+    }
+
+    my $checksums = '';
+    foreach my $file (keys %files) {
+	next if $file eq '.' or $file eq './';
+
+	print "$file\n";
+
+        $nail->add_files($file);
+	my $checksum = checksum($file);
+	$checksums .= "$checksum $file\n";
+    }
+
+    $nail->add_data(SUMSFILE, $checksums);
+    $nail->add_data(VERSIONFILE, "$name $tag");
+
+    $nail->write($outfilename, 1);
+}
+
+sub remove_package {
+    die "No version file found in current directory\n" unless -f VERSIONFILE; 
+    die "No checksums file found in current directory\n" unless -f SUMSFILE;
+
+    {
+	open my $fh, '<', VERSIONFILE or die "Could not open versions file: `$!'\n";
+	my $line = <$fh>;
+	chomp $line;
+	my ($name, $previous) = split ' ', $line, 2;
+	print STDERR "Removing package $name version $previous\n";
+	close $fh;
+    }
+    
+    {
+	my @files = ();
+	my @dirs = ();
+
+	my $mismatch = 0;
+
+	open my $fh, '<', SUMSFILE or die "Could not open sums file: `$!'\n";
+	while (my $line = <$fh>) {
+	    chomp $line;
+
+	    my ($checksum, $filename) = split ' ', $line, 2;
+	    if ($checksum eq 'DIR') {
+		push @dirs, $filename;
+		next;
+	    }
+
+	    if (-f $filename && checksum($filename) ne $checksum) {
+		print STDERR "$filename has been locally modified!\n";
+		$mismatch = 1;
+	    }
+
+	    push @files, $filename;
+	}
+
+	if ($mismatch) {
+	    if ($FORCE) {
+		print STDERR "Forcing removal of locally modified files\n";
+	    } else {
+		print STDERR "Locally modified files found, use --force to continue\n";
+		exit -1;
+	    }
+	}
+
+	foreach my $file (@files, VERSIONFILE, SUMSFILE) {
+	    unlink $file or warn "Could not remove `$file' $!\n";
+	}
+
+	foreach my $dir (@dirs) {
+	    rmdir $dir or warn "Could not remove directory `$dir': $!\n";
+	}
+    }
+}
+
+sub install_package {
+    my ($filename) = @_;
+
+    die "Package `$filename' not found\n" unless -f $filename;
+
+    if (-f VERSIONFILE) {
+	open my $fh, '<', VERSIONFILE or die "Could not open versions file: `$!'\n";
+	my $line = <$fh>;
+	chomp $line;
+	my ($name, $previous) = split ' ', $line, 2;
+
+	print STDERR "Upgrading from version $previous\n";
+	close $fh;
+    } else {
+	print STDERR "New installation\n";
+    }
+
+    if (-f SUMSFILE) {
+	open my $fh, '<', SUMSFILE or die "Could not open sums file: `$!'\n";
+
+	my $mismatch = 0;
+
+	while (my $line = <$fh>) {
+	    chomp $line;
+
+	    my ($checksum, $filename) = split ' ', $line, 2;
+
+	    if ($checksum eq 'DIR') {
+		next;
+	    }
+
+	    if (-f $filename && checksum($filename) ne $checksum) {
+		print STDERR "$filename has been locally modified!\n";
+		$mismatch = 1;
+	    }
+	}
+	close $fh;
+
+	if ($mismatch) {
+	    if ($FORCE) {
+		print STDERR "Forcing overwrite of locally modified files\n";
+	    } else {
+		print STDERR "Locally modified files found, use --force to continue\n";
+		exit -1;
+	    }
+	}
+    }
+
+    my $nail = Archive::Tar->new($filename);
+    $nail->extract();
+}
+
+sub list_package {
+    my ($filename) = @_;
+
+    die "No package specified\n" unless $filename;
+    die "Package `$filename' not found\n" unless -f $filename;
+
+    my $nail = Archive::Tar->new($filename);
+
+    my @files = $nail->list_files(); 
+    my $sumdata = $nail->get_content(SUMSFILE);
+    my $versiondata = $nail->get_content(VERSIONFILE);
+
+    chomp $versiondata;
+    my ($name, $version) = split ' ', $versiondata, 2;
+
+    my %checksums = ();
+
+    foreach my $line (split "\r?\n", $sumdata) {
+	my ($checksum, $file) = split ' ', $line, 2;
+
+	$checksums{$file} = $checksum;
+    }
+
+    print STDERR "\nPackage: $name\nversion: $version\n\n\n";
+    foreach my $file (@files) {
+	my $display = $file;
+
+	next if $file eq SUMSFILE or $file eq VERSIONFILE;
+
+	if ($file =~ /^\.\//) {
+	    $display =~ s/^\.\///; 
+	} else {
+	    $display = $file;
+	    $file = "./$file";
+	}
+
+	my $checksum = $checksums{$file} || 'NOT FOUND';
+
+	printf STDERR "%-32s\t%s\n", $checksum, $display;
+    }
+
+    print STDERR "\n";
+}
+
+sub diff_package {
+    my ($filename, @files) = @_;
+
+    die "No package specified\n" unless $filename;
+    die "Package `$filename' not found\n" unless -f $filename;
+
+    my $use_shell_diff = 0;
+    
+    eval {
+	require Text::Diff;
+    };
+
+    if ($@) {
+	if ($FORCE) {
+	    print STDERR "Using shell diff\n";
+	    $use_shell_diff = 1; 
+	} else {
+	    die "Text::Diff is not installed, use --force to fallback to shell diff\n";
+	}
+    }
+
+    my $nail = Archive::Tar->new($filename);
+
+    @files = @files ? @files : $nail->list_files();
+    my $sumdata = $nail->get_content(SUMSFILE);
+    my $versiondata = $nail->get_content(VERSIONFILE);
+
+    chomp $versiondata;
+    my ($name, $version) = split ' ', $versiondata, 2;
+
+    my %checksums = ();
+
+    foreach my $line (split "\r?\n", $sumdata) {
+        my ($checksum, $file) = split ' ', $line, 2;
+
+        $checksums{$file} = $checksum;
+    }
+
+    foreach my $file (@files) {
+	next if $file eq SUMSFILE or $file eq VERSIONFILE;
+
+	if ($file !~ /^\.\//) {
+	    $file = "./$file";
+	}
+
+	my $checksum = $checksums{$file};
+
+	if ($checksum ne checksum($file)) {
+	    my $content = $nail->get_content($file);
+
+	    if (-B $file) {
+		print "Binary file $file differs\n";
+		next;
+	    }
+
+	    if ($use_shell_diff) {
+		my $tmp = File::Temp->new();
+
+		print $tmp $content;
+		close $tmp;
+
+		my $name = $tmp->filename();
+
+		my ($left, $right) = $REVERSE ? ($file, $name) : ($name, $file);
+
+		my $diff = `diff -u $left $right`;
+		$diff =~ s/$name/$file/g;
+		print $diff;
+	    } else {
+		my ($left, $right) = $REVERSE ? ($file, \$content) : (\$content, $file);
+
+		my $diff = Text::Diff::diff($left, $right, {STYLE => 'Unified'});
+		print "--- $file\n";
+		print "+++ $file\n";
+		print $diff;
+	    }
+	}
+    }
+}
+
+sub status_package {
+    die "No checksums file found in current directory\n" unless -f SUMSFILE;
+
+    my %checksums = ();
+
+    {
+	open my $fh, '<', VERSIONFILE or die "Could not open version file: $!\n";
+
+	my $versiondata = <$fh>;
+
+	chomp $versiondata;
+	my ($name, $version) = split ' ', $versiondata, 2;
+
+	close $fh;
+
+	print STDERR "\nPackage: $name\nversion: $version\n\n\n";
+    }
+
+    open my $fh, '<', SUMSFILE or die "Could not open sums file: $!\n";
+    while (my $line = <$fh>) {
+	chomp $line;
+
+        my ($checksum, $file) = split ' ', $line, 2;
+
+        $checksums{$file} = $checksum;	
+    }
+
+    my %files = ();
+
+    find(
+	sub {
+	    my $curfile = $File::Find::name;
+	    my $curdir = $File::Find::dir;
+
+	    return if $_ eq SUMSFILE;
+	    return if $_ eq VERSIONFILE;
+
+	    return if $curfile eq '.' or $curfile eq './';
+
+	    $files{$curfile} = 1;
+	},
+	'.'
+    );
+
+    foreach my $file (keys %checksums) {
+	$files{$file} = 1;
+    }
+
+    foreach my $file (sort keys %files) {
+	my $checksum = $checksums{$file};
+
+	(my $display = $file) =~ s/^\.\///; 
+
+	unless ($checksum) {
+	    print STDERR "$display not known to package\n";
+	    next;
+	}
+
+	unless (-e $file) {
+	    print STDERR "$display missing\n";
+	    next;
+	}
+
+	if ($checksum eq checksum($file)) {
+	    print STDERR "$display up-to-date\n";
+	    next;
+	} else {
+	    print STDERR "$display locally modified\n";
+	}
+    }
+
+    print STDERR "\n";
+}
+
+sub checksum {
+    my ($filename) = @_;
+
+    return 'DIR' if -d $filename;
+
+    my $ctx = Digest::MD5->new;
+
+    $filename = "./$filename";
+
+    open my $fh, '<', $filename or die "Could not open `$filename': $!\n";
+    $ctx->addfile($fh);
+    my $digest = $ctx->hexdigest();
+    close $fh;
+
+    return $digest;
+}
