@@ -8,6 +8,9 @@ use File::Find qw/find/;
 use Digest::MD5 qw/md5_hex/;
 use Getopt::Long qw/GetOptions/;
 use File::Temp qw//;
+use File::Copy qw/copy/;
+use File::Path qw/mkpath/;
+use Cwd qw/cwd/;
 
 use constant SPECFILE => 'nail.spec';
 use constant SUMSFILE => '.nailsums';
@@ -17,7 +20,7 @@ my $FORCE = 0;
 my $REVERSE = 0;
 GetOptions(
     force => \$FORCE,
-    'reverse' => \$REVERSE,
+    reverse => \$REVERSE,
 );
 main(@ARGV);
 
@@ -51,8 +54,8 @@ Usage: $0 <command> [args]
     list <package file>
     status
     diff <package file>
-    install <package file>
-    remove
+    install <package file> [install directory]
+    remove [install directory]
 EOF
 }
 
@@ -62,6 +65,7 @@ sub make_package {
     die "Name not set\n" unless $name;
     die "Tag not set\n" unless $tag;
 
+    my $cwd = cwd();
     chdir '/tmp';
 
     eval {
@@ -162,9 +166,17 @@ sub make_package {
     $nail->add_data(VERSIONFILE, "$name $tag");
 
     $nail->write($outfilename, 1);
+
+    copy $outfilename, "$cwd/$outfilename";
 }
 
 sub remove_package {
+    my ($destdir) = @_;
+
+    if ($destdir) {
+	chdir $destdir;
+    }
+
     die "No version file found in current directory\n" unless -f VERSIONFILE; 
     die "No checksums file found in current directory\n" unless -f SUMSFILE;
 
@@ -221,9 +233,17 @@ sub remove_package {
 }
 
 sub install_package {
-    my ($filename) = @_;
+    my ($filename, $destdir) = @_;
 
     die "Package `$filename' not found\n" unless -f $filename;
+
+    my $cwd = cwd();
+    if ($destdir) {
+	mkpath $destdir unless -d $destdir;
+	chdir $destdir;
+    }
+
+    my $nail = Archive::Tar->new(-f $filename ? $filename : "$cwd/$filename");
 
     if (-f VERSIONFILE) {
 	open my $fh, '<', VERSIONFILE or die "Could not open versions file: `$!'\n";
@@ -231,10 +251,20 @@ sub install_package {
 	chomp $line;
 	my ($name, $previous) = split ' ', $line, 2;
 
-	print STDERR "Upgrading from version $previous\n";
+	my ($package, $version) = get_package_info($nail);
+
+	die "Trying to upgrade an installation of `$name' with a package of `$package', cannot continue\n" unless $package eq $name;;
+
+	print STDERR "Upgrading `$package' from version $previous to $version\n";
 	close $fh;
     } else {
 	print STDERR "New installation\n";
+    }
+
+
+    if (-f VERSIONFILE) {
+
+	open my $fh, '<', SUMSFILE or die "Could not open sums file: `$!'\n";
     }
 
     if (-f SUMSFILE) {
@@ -268,7 +298,7 @@ sub install_package {
 	}
     }
 
-    my $nail = Archive::Tar->new($filename);
+
     $nail->extract();
 }
 
@@ -477,7 +507,7 @@ sub checksum {
 
     my $ctx = Digest::MD5->new;
 
-    $filename = "./$filename";
+    $filename = "./$filename" unless $filename =~ /^\.\//;;
 
     open my $fh, '<', $filename or die "Could not open `$filename': $!\n";
     $ctx->addfile($fh);
@@ -485,4 +515,14 @@ sub checksum {
     close $fh;
 
     return $digest;
+}
+
+sub get_package_info {
+    my ($nail) = @_;
+
+    my $versiondata = $nail->get_content(VERSIONFILE);
+
+    my ($package, $version) = split ' ', $versiondata;
+    
+    return ($package, $version);
 }
