@@ -394,7 +394,14 @@ sub diff_package {
 	my $checksum = $checksums{$file};
 
 	if ($checksum ne checksum($file)) {
-	    my $content = $nail->get_content($file);
+	    my $content;
+
+	    if ($nail->contains_file($file)) {
+		$content = $nail->get_content($file);
+	    } else {
+		(my $newfile = $file) =~ s/^\.\///;
+		$content = $nail->get_content($newfile);
+	    }
 
 	    if (-B $file) {
 		print "Binary file $file differs\n";
