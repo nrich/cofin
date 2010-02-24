@@ -50,11 +50,11 @@ sub main {
 sub usage {
     print STDERR <<EOF;
 Usage: $0 <command> [args]
-    package <CVS module> <CVS tag>
-    list <package file>
+    package [--svn] <CVS module> <CVS tag>
+    list <package file|URL to package file>
     status
-    diff <package file>
-    install <package file> [install directory]
+    diff [--reverse] <package file|URL to package file>
+    install <package file|URL to package file> [install directory]
     remove [install directory]
 EOF
 }
@@ -226,7 +226,7 @@ sub remove_package {
 	    unlink $file or warn "Could not remove `$file' $!\n";
 	}
 
-	foreach my $dir (@dirs) {
+	foreach my $dir (sort {length $b <=> length $a} @dirs) {
 	    rmdir $dir or warn "Could not remove directory `$dir': $!\n";
 	}
     }
@@ -235,15 +235,22 @@ sub remove_package {
 sub install_package {
     my ($filename, $destdir) = @_;
 
-    die "Package `$filename' not found\n" unless -f $filename;
-
-    my $cwd = cwd();
     if ($destdir) {
 	mkpath $destdir unless -d $destdir;
 	chdir $destdir;
     }
 
-    my $nail = Archive::Tar->new(-f $filename ? $filename : "$cwd/$filename");
+    my $nail = open_package($filename);
+    die "Package `$filename' not found\n" unless $nail;
+
+    my $sumdata = $nail->get_content(SUMSFILE);
+    my %package_checksums = ();
+
+    foreach my $line (split "\r?\n", $sumdata) {
+        my ($checksum, $file) = split ' ', $line, 2;
+
+        $package_checksums{$file} = $checksum;
+    }
 
     if (-f VERSIONFILE) {
 	open my $fh, '<', VERSIONFILE or die "Could not open versions file: `$!'\n";
@@ -263,7 +270,6 @@ sub install_package {
 
 
     if (-f VERSIONFILE) {
-
 	open my $fh, '<', SUMSFILE or die "Could not open sums file: `$!'\n";
     }
 
@@ -282,8 +288,12 @@ sub install_package {
 	    }
 
 	    if (-f $filename && checksum($filename) ne $checksum) {
-		print STDERR "$filename has been locally modified!\n";
-		$mismatch = 1;
+		if (checksum($filename) eq $package_checksums{$filename}) {
+		    print STDERR "$filename has been locally modified but matches package\n";
+		} else {
+		    print STDERR "$filename has been locally modified!\n";
+		    $mismatch = 1;
+		}
 	    }
 	}
 	close $fh;
@@ -297,7 +307,6 @@ sub install_package {
 	    }
 	}
     }
-
 
     $nail->extract();
 }
@@ -350,7 +359,8 @@ sub diff_package {
     my ($filename, @files) = @_;
 
     die "No package specified\n" unless $filename;
-    die "Package `$filename' not found\n" unless -f $filename;
+    my $nail = open_package($filename);
+    die "Package `$filename' not found\n" unless $nail;
 
     my $use_shell_diff = 0;
     
@@ -367,7 +377,6 @@ sub diff_package {
 	}
     }
 
-    my $nail = Archive::Tar->new($filename);
 
     @files = @files ? @files : $nail->list_files();
     my $sumdata = $nail->get_content(SUMSFILE);
@@ -386,6 +395,11 @@ sub diff_package {
 
     foreach my $file (@files) {
 	next if $file eq SUMSFILE or $file eq VERSIONFILE;
+
+	unless (-e $file) {
+	    print "File `$file' not found\n";
+	    next;
+	}
 
 	if ($file !~ /^\.\//) {
 	    $file = "./$file";
@@ -532,4 +546,35 @@ sub get_package_info {
     my ($package, $version) = split ' ', $versiondata;
     
     return ($package, $version);
+}
+
+sub open_package {
+    my ($path) = @_;
+
+    my $nail;
+    if ($path =~ /^(https?|ftp):\/\//) {
+        require LWP::UserAgent;
+	require IO::String;
+	require IO::Uncompress::Gunzip;
+
+        my $ua = LWP::UserAgent->new();
+        $ua->timeout(10);
+
+        my $response = $ua->get($path);
+
+        if ($response->is_success()) {
+	    my $content = $response->content();
+	    $nail = Archive::Tar->new();
+	    open my $fh, '<', $content;
+	    $nail->read(IO::Uncompress::Gunzip->new(IO::String->new($content)));
+        }
+        else {
+            die "Error retrieving `$path': ", $response->status_line(), "\n";
+        }
+    } else { 
+	my $cwd = cwd();
+	$nail = Archive::Tar->new(-f $path ? $path : "$cwd/$path");
+    }
+
+    return $nail;
 }
