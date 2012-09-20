@@ -9,7 +9,7 @@ use Digest::MD5 qw/md5_hex/;
 use Getopt::Long qw/GetOptions/;
 use File::Temp qw//;
 use File::Copy qw/copy/;
-use File::Path qw/mkpath/;
+use File::Path qw/mkpath rmtree/;
 use Cwd qw/cwd/;
 use Sys::Hostname qw/hostname/;
 
@@ -23,6 +23,11 @@ my @META_FIELDS = qw(
     Packager
     Description
     Homepage
+);
+
+my @META_RO = qw(
+    Built
+    VCS
 );
 
 my $FORCE = 0;
@@ -136,7 +141,9 @@ sub make_package {
     } elsif (lc $VCS eq 'git') {
 	my $repos = $name;
 
-	($name) = $repos =~ /([^\/]+?)\.git$/g;
+	($name) = $repos =~ /([^\/]+?)\.git\/?$/g;
+
+	die "Could not resolve git repository name\n" unless $name;
 
 	eval {
 	    die "TODO: find standard git perl client\n";
@@ -158,6 +165,8 @@ sub make_package {
 	my $repos = $name;
 
 	($name) = $repos =~ /([^\/]+?)$/g;
+
+	die "Could not resolve hg repository name\n" unless $name;
 
 	eval {
 	    die "TODO: find standard hg perl client\n";
@@ -182,7 +191,7 @@ sub make_package {
     my $outfilename = "$name-$tag.nail";
 
     my $spec = {};
-    open my $fh, '<', SPECFILE or die "Could not load spec file: `$!'";
+    open my $fh, '<', SPECFILE or warn "Could not load spec file: `$!'; using defaults";
 
     my $ops = {
         '+' => 'add',
@@ -266,13 +275,20 @@ sub make_package {
 	$metadata .= "$field: $value\n";
     }
 
+    $metadata .= sprintf "Built: %d\n", time();
+    $metadata .= sprintf "VCS: %s\n", $VCS;
+
     $nail->add_data(SUMSFILE, $checksums);
     $nail->add_data(METAFILE, $metadata);
     $nail->add_data(VERSIONFILE, "$name $tag");
 
     $nail->write($outfilename, 1);
 
-    copy $outfilename, "$cwd/$outfilename";
+    copy $outfilename, "$cwd/$outfilename" or die "Could not copy `$outfilename' to `$cwd/$outfilename`: $!\n";
+    
+    my $tmpdir = cwd();
+    chdir '/tmp';
+    rmtree $tmpdir or die "Could not clean up `$tmpdir': $!\n";
 }
 
 sub remove_package {
@@ -419,7 +435,7 @@ sub list_package {
 
     my %checksums = get_package_checksums($nail);
 
-    print STDERR "\nPackage: $name\nversion: $version\n\n\n";
+    print STDERR "\nPackage: $name\nVersion: $version\n\n\n";
     foreach my $file (@files) {
 	my $display = $file;
 
@@ -537,7 +553,7 @@ sub status_package {
 
 	close $fh;
 
-	print STDERR "\nPackage: $name\nversion: $version\n\n\n";
+	print STDERR "\nPackage: $name\nVersion: $version\n\n\n";
     }
 
     open my $fh, '<', SUMSFILE or die "Could not open sums file: $!\n";
@@ -607,11 +623,13 @@ sub info_package {
 
     print STDERR "Name: $package\n";
     print STDERR "Version: $version\n";
-    foreach my $field (@META_FIELDS) {
+    foreach my $field (@META_FIELDS, 'VCS') {
 	my $value = $meta{$field} || '<Not Set>';
 
 	print STDERR "$field: $value\n";
     }
+
+    printf STDERR "Built: %s\n", scalar localtime($meta{Built}||0);
 }
 
 sub checksum {
@@ -647,7 +665,7 @@ sub get_package_meta {
 
     my $metadata = $nail->get_content(METAFILE)||'';
 
-    my $fields = join '|', @META_FIELDS; 
+    my $fields = join '|', (@META_FIELDS, @META_RO); 
 
     my %meta = map {$_ =~ /^($fields)\:\s*(.+?)$/} split "\r?\n", $metadata;
     
@@ -692,7 +710,7 @@ sub open_package {
         else {
             die "Error retrieving `$path': ", $response->status_line(), "\n";
         }
-    } elsif ($path =~ /^(ssh|sftp):\/\/(?:([^\@]+?)@)?([^\/\:]+?)(?:\:(\d+))?\/(.+?)$/) {
+    } elsif ($path =~ /^s(sh|ftp):\/\/(?:([^\@]+?)@)?([^\/\:]+?)(?:\:(\d+))?\/(.+?)$/) {
         require Net::SFTP::Foreign;
         require IO::Uncompress::Gunzip;
 
